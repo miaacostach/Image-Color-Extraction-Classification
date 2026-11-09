@@ -2,16 +2,16 @@
 # python -m pip install pymupdf pandas pillow
 """Extraccion del catalogo de descriptores de mangos criollos de Colombia.
 
-Disenado y comprobado para el PDF adjunto (88 paginas), no para cualquier PDF.
+Diseñado y comprobado para el PDF adjunto (88 paginas), no para cualquier PDF.
 Ejecutar completo en Positron. No necesita OCR, internet, OpenCV ni Poppler.
 Conserva texto literal, imagenes incrustadas y trazabilidad; no corrige el libro.
 """
 
-# %% CONFIGURACION: modificar estas rutas en Windows
+# %% CONFIGURACION: modificar estas rutas segun el archivo 
 from pathlib import Path
 PDF = Path(r"D:/R/K_means/Mango/CTLG_Descriptores+de+mangos+criollos.pdf") # Path archivo .PDF
 SALIDA = Path(r"D:/R/K_means/Mango/extraccion_catalogo") # Path donde guardar los archivos de salida.
-PAGINA_INICIAL = 29
+PAGINA_INICIAL = 29 # Desde esta pagina comienza la informacion relevante para la extracción
 PAGINA_FINAL = 81
 NUMERACION = "impresa"  # "impresa" o "pdf" (contador del visor, comenzando en 1)
 INCLUIR_PAREJA = True  # incorpora pagina contigua para completar cada accesion
@@ -434,7 +434,7 @@ def ejecutar(pdf, salida, inicio, fin, numeracion):
     return resumen
 
 
-# %% EJECUCION: Positron (Run File) o terminal con argumentos opcionales
+# %% EJECUCION: Positron (Run File) o terminal 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pdf", type=Path, default=PDF)
