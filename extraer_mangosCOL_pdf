@@ -1,0 +1,446 @@
+# %% INSTALACION (ejecutar en la terminal del mismo entorno de Positron)
+# python -m pip install pymupdf pandas pillow
+"""Extraccion del catalogo de descriptores de mangos criollos de Colombia.
+
+Disenado y comprobado para el PDF adjunto (88 paginas), no para cualquier PDF.
+Ejecutar completo en Positron. No necesita OCR, internet, OpenCV ni Poppler.
+Conserva texto literal, imagenes incrustadas y trazabilidad; no corrige el libro.
+"""
+
+# %% CONFIGURACION: modificar estas rutas en Windows
+from pathlib import Path
+PDF = Path(r"D:/R/K_means/Mango/CTLG_Descriptores+de+mangos+criollos.pdf") # Path archivo .PDF
+SALIDA = Path(r"D:/R/K_means/Mango/extraccion_catalogo") # Path donde guardar los archivos de salida.
+PAGINA_INICIAL = 29
+PAGINA_FINAL = 81
+NUMERACION = "impresa"  # "impresa" o "pdf" (contador del visor, comenzando en 1)
+INCLUIR_PAREJA = True  # incorpora pagina contigua para completar cada accesion
+GENERAR_REVISION = True  # miniaturas y paginas de referencia; no son para medir color
+
+# %% IMPORTACIONES
+import argparse
+import hashlib
+import io
+import itertools
+import json
+import logging
+import platform
+import re
+import sqlite3
+import unicodedata
+from datetime import datetime, timezone
+
+try:
+    import fitz  # paquete pymupdf; NO instalar el paquete llamado "fitz"
+    import pandas as pd
+    from PIL import Image, ImageCms, ImageDraw, ImageFont
+except ImportError as exc:
+    raise SystemExit("Instale: python -m pip install pymupdf pandas pillow") from exc
+
+
+def limpiar(texto):
+    return re.sub(r"\s+", " ", texto.replace("\xad", "")).strip()
+
+
+def slug(texto):
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-zA-Z0-9]+", "_", texto).strip("_").lower()
+
+
+def sha256(datos):
+    return hashlib.sha256(datos).hexdigest()
+
+
+def lineas(pagina):
+    """Texto horizontal con coordenadas; mantiene etiquetas y valores separados."""
+    resultado = []
+    for bloque in pagina.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)["blocks"]:
+        for linea in bloque.get("lines", []):
+            if abs(linea["dir"][1]) > 0.1:
+                continue  # titulos verticales de las secciones
+            texto = limpiar("".join(s["text"] for s in linea["spans"]))
+            if texto:
+                resultado.append({"texto": texto, "bbox": list(linea["bbox"]),
+                                  "fuentes": sorted({s["font"] for s in linea["spans"]})})
+    return resultado
+
+
+def identificador(pagina):
+    ids = set(re.findall(r"\b721\d{5}\b", pagina.get_text()))
+    if len(ids) != 1:
+        raise ValueError(f"Se esperaba un registro GRIN unico: {ids}")
+    return ids.pop()
+
+
+def pagina_impresa(pagina):
+    candidatos = [l["texto"] for l in lineas(pagina)
+                  if l["bbox"][1] > 570 and re.fullmatch(r"\d{1,3}", l["texto"])]
+    if len(candidatos) != 1:
+        raise ValueError("No se pudo identificar de forma univoca el numero impreso.")
+    return int(candidatos[0])
+
+
+# Columnas reales del diseno editorial, en puntos PDF (pagina de 792 x 612).
+# seccion, x etiqueta, x valor, limite derecho, y inicial, y final, filas esperadas
+ZONAS = [
+    ("arbol", 98, 275, 375, 35, 165, 11),
+    ("hojas", 98, 275, 375, 165, 330, 14),
+    ("inflorescencias_flores", 98, 275, 375, 330, 519, 16),
+    ("fruto", 410, 596, 735, 35, 380, 30),
+    ("hueso", 410, 482, 538, 380, 469, 7),
+    ("hueso", 540, 703, 735, 380, 469, 6),
+    ("semilla", 478, 535, 605, 473, 518, 3),
+    ("semilla", 608, 674, 735, 473, 518, 3),
+    ("fisicoquimicas", 597, 708, 735, 520, 564, 3),
+]
+ETIQUETAS = {
+    "Hábito de crecimiento": "arbol_habito",
+    "Ramificación del árbol": "arbol_ramificacion",
+    "Hojas maduras": "hojas_maduras",
+    "Hojas inmaduras": "hojas_inmaduras",
+    "Apariencia de la inflorescencia": "inflorescencia",
+    "Apariencia de la pulpa": "pulpa",
+    "Fruto maduro": "fruto_maduro",
+}
+
+
+def pasaporte(pagina):
+    mapa = {"Especie": "especie", "Nombre de la accesión": "nombre_accesion",
+            "Fecha de introducción": "fecha_introduccion_original",
+            "Municipio, departamento, país": "localidad_original",
+            "Datos complementarios": "datos_complementarios"}
+    datos = {}
+    for linea in lineas(pagina):
+        if linea["bbox"][1] > 112:
+            continue
+        for etiqueta, campo in mapa.items():
+            if linea["texto"].startswith(etiqueta):
+                datos[campo] = linea["texto"][len(etiqueta):].strip()
+    faltan = set(mapa.values()) - set(datos)
+    if faltan:
+        raise ValueError(f"Pasaporte incompleto: {faltan}")
+    datos["fecha_introduccion_iso"] = datetime.strptime(
+        datos["fecha_introduccion_original"], "%d/%m/%Y").date().isoformat()
+    return datos
+
+
+def extraer_descriptores(pagina, registro, avisar):
+    ls = lineas(pagina)
+    filas = []
+    for seccion, xi, xv, xf, yi, yf, esperado in ZONAS:
+        # Algunas respuestas largas invaden la columna de etiquetas (p. ej.
+        # "Niveladas con la superficie"). La tipografia permite distinguirlas.
+        etiquetas = [l for l in ls if xi <= l["bbox"][0] < xv and yi <= l["bbox"][1] < yf
+                     and "RobotoCondensed-Regular" in l["fuentes"]]
+        valores = [l for l in ls if xi <= l["bbox"][0] < xf and yi <= l["bbox"][1] < yf
+                   and "RobotoCondensed-Light" in l["fuentes"]
+                   and not re.fullmatch(r"721\d{5}", l["texto"])]
+        if len(etiquetas) != esperado:
+            avisar(registro, "conteo_etiquetas", f"{seccion}: {len(etiquetas)} / {esperado}")
+        usados = set()
+        for etiqueta in sorted(etiquetas, key=lambda l: l["bbox"][1]):
+            cercanos = [(j, l) for j, l in enumerate(valores)
+                        if abs(l["bbox"][1] - etiqueta["bbox"][1]) <= 2.5]
+            if len(cercanos) != 1:
+                avisar(registro, "valor_ausente_o_ambiguo", f"{seccion}: {etiqueta['texto']}")
+            texto = " | ".join(l["texto"] for _, l in cercanos)
+            usados.update(j for j, _ in cercanos)
+            nulo = texto.upper() in {"NA", "N/A", "N.A.", "", "ND", "S/D"}
+            # Solo convierte numeros completos; no altera Munsell, porcentajes escritos ni categorias.
+            numero = float(texto.replace(",", ".")) if re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?", texto) else None
+            unidad = re.search(r"\(([^()]*)\)", etiqueta["texto"])
+            campo = seccion + "__" + slug(etiqueta["texto"])
+            if etiqueta["texto"] == "Espesor de pulpa (cm)" and numero is not None and numero > 10:
+                avisar(registro, "verificar_fuente", f"{etiqueta['texto']} = {texto}; conservar, revisar unidad/dato del libro")
+            filas.append({"registro_grin": registro, "seccion": seccion,
+                          "campo": campo, "descriptor_original": etiqueta["texto"],
+                          "unidad_declarada": unidad.group(1) if unidad else "",
+                          "valor_original": texto, "valor_numerico": numero,
+                          "es_faltante": nulo, "pagina_pdf": pagina.number + 1,
+                          "pagina_impresa": pagina_impresa(pagina),
+                          "bbox_etiqueta": json.dumps(etiqueta["bbox"]),
+                          "bbox_valor": json.dumps([l["bbox"] for _, l in cercanos])})
+        for j, valor in enumerate(valores):
+            if j not in usados:
+                avisar(registro, "valor_sin_etiqueta", f"{seccion}: {valor}")
+    observaciones = [l for l in ls if 180 <= l["bbox"][0] < 475 and 520 <= l["bbox"][1] < 565]
+    obs = " ".join(l["texto"] for l in sorted(observaciones, key=lambda l: l["bbox"][1]))
+    return filas, obs
+
+
+def perfil_pdf(doc, xref):
+    """Recupera ICC aunque el JPEG no lo lleve dentro (caso de este catalogo)."""
+    _, espacio = doc.xref_get_key(xref, "ColorSpace")
+    if re.fullmatch(r"\d+ 0 R", espacio):
+        espacio = doc.xref_object(int(espacio.split()[0]))
+    m = re.search(r"/ICCBased\s+(\d+)\s+0\s+R", espacio)
+    return doc.xref_stream(int(m.group(1))) if m else None
+
+
+def orientar(imagen, transformacion):
+    """Solo giros de 90 grados/reflejos: sin interpolar ni modificar colores."""
+    a, b, c, d, _, _ = transformacion
+    eps = max(abs(a), abs(b), abs(c), abs(d)) * 1e-4
+    T = Image.Transpose
+    if abs(b) < eps and abs(c) < eps:
+        operacion = (T.FLIP_LEFT_RIGHT if a < 0 else None) if d > 0 else (T.ROTATE_180 if a < 0 else T.FLIP_TOP_BOTTOM)
+    elif abs(a) < eps and abs(d) < eps:
+        operacion = (T.TRANSPOSE if c > 0 else T.ROTATE_270) if b > 0 else (T.ROTATE_90 if c > 0 else T.TRANSVERSE)
+    else:
+        return imagen, "transformacion_no_ortogonal_revisar"
+    return (imagen.transpose(operacion), operacion.name) if operacion is not None else (imagen, "identidad")
+
+
+def extraer_imagenes(doc, pagina, registro, nombre, salida, avisar):
+    ls = [l for l in lineas(pagina) if l["texto"] in ETIQUETAS]
+    manifiesto = []
+    infos = pagina.get_image_info(xrefs=True)
+    asignaciones = {}
+    # Una foto girada puede tener un bbox que invade el panel vecino. Asignacion
+    # global uno a uno: una misma leyenda nunca clasifica dos fotografias.
+    if len(infos) == len(ls) and len(ls) <= 7:
+        costos = []
+        for info in infos:
+            r = fitz.Rect(info["bbox"])
+            fila = []
+            for l in ls:
+                x = (l["bbox"][0] + l["bbox"][2])/2
+                y = (l["bbox"][1] + l["bbox"][3])/2
+                costo = ((x-(r.x0+r.x1)/2)/r.width)**2 + ((y-(r.y0+r.y1)/2)/r.height)**2
+                fila.append(costo + (0 if r.contains(fitz.Point(x, y)) else 100))
+            costos.append(fila)
+        orden = min(itertools.permutations(range(len(ls))),
+                    key=lambda perm: sum(costos[j][k] for j, k in enumerate(perm)))
+        asignaciones = {j: ls[k] for j, k in enumerate(orden)}
+        for j, k in enumerate(orden):
+            if costos[j][k] >= 100:
+                avisar(registro, "leyenda_fuera_de_imagen", ls[k]["texto"])
+    revision = pagina.get_pixmap(matrix=fitz.Matrix(1.4, 1.4)) if GENERAR_REVISION else None
+    for indice, info in enumerate(infos, 1):
+        rect = fitz.Rect(info["bbox"])
+        candidatos = [asignaciones[indice-1]] if indice-1 in asignaciones else [l for l in ls if rect.contains(fitz.Point(
+            (l["bbox"][0] + l["bbox"][2]) / 2, (l["bbox"][1] + l["bbox"][3]) / 2))]
+        tipo = ETIQUETAS[candidatos[0]["texto"]] if len(candidatos) == 1 else f"sin_clasificar_{indice:02d}"
+        if len(candidatos) != 1:
+            avisar(registro, "imagen_sin_etiqueta_unica", f"Imagen {indice}: {len(candidatos)} etiquetas")
+        xref = info["xref"]
+        if not xref:
+            avisar(registro, "imagen_sin_xref", str(info))
+            continue
+        contenido = doc.extract_image(xref)
+        base = f"{registro}_{slug(nombre)}_{tipo}_{indice:02d}"
+        original = salida / "imagenes_originales" / f"{base}.{contenido['ext']}"
+        original.write_bytes(contenido["image"])
+        icc = perfil_pdf(doc, xref)
+        icc_rel = ""
+        if icc:
+            perfil = salida / "perfiles_icc" / f"{sha256(icc)[:16]}.icc"
+            perfil.write_bytes(icc)
+            icc_rel = perfil.relative_to(salida).as_posix()
+        im = Image.open(io.BytesIO(contenido["image"]))
+        im.load()
+        icc = icc or im.info.get("icc_profile")
+        descripcion_icc = "sin_perfil"
+        if icc:
+            try:
+                descripcion_icc = ImageCms.getProfileDescription(ImageCms.ImageCmsProfile(io.BytesIO(icc))).strip()
+            except Exception as exc:
+                avisar(registro, "perfil_icc_no_legible", str(exc))
+        # No se usa convert('RGB') silenciosamente: podria cambiar los valores.
+        if im.mode not in {"RGB", "L", "RGBA"}:
+            avisar(registro, "modo_no_rgb", f"{base}: {im.mode}; original conservado")
+            ruta_png = ""
+            giro = "no_generado"
+            ancho, alto = im.size
+        else:
+            im, giro = orientar(im, info["transform"])
+            ancho, alto = im.size
+            carpeta = tipo if tipo in {"fruto_maduro", "pulpa"} else "otros_organos"
+            png = salida / "imagenes_png" / carpeta / f"{base}.png"
+            buffer_png = io.BytesIO()
+            im.save(buffer_png, format="PNG", icc_profile=icc) if icc else im.save(buffer_png, format="PNG")
+            png.write_bytes(buffer_png.getvalue())
+            with Image.open(png) as comprobacion:
+                comprobacion.load()
+                if comprobacion.tobytes() != im.tobytes():
+                    raise ValueError(f"PNG no conserva pixeles: {png}")
+            ruta_png = png.relative_to(salida).as_posix()
+            if giro == "transformacion_no_ortogonal_revisar":
+                avisar(registro, "orientacion_revisar", base)
+        _, smask = doc.xref_get_key(xref, "SMask")
+        if smask not in {"null", "None"}:
+            avisar(registro, "mascara_pdf", f"{base}: {smask}; revisar transparencia")
+        manifiesto.append({"registro_grin": registro, "nombre_accesion": nombre,
+                          "tipo": tipo, "pagina_pdf": pagina.number + 1,
+                          "pagina_impresa": pagina_impresa(pagina), "xref": xref,
+                          "bbox_pdf": json.dumps(info["bbox"]),
+                          "transformacion_pdf": json.dumps(info["transform"]),
+                          "ancho_original_px": info["width"], "alto_original_px": info["height"],
+                          "ancho_png_px": ancho, "alto_png_px": alto, "modo": im.mode,
+                          "orientacion_aplicada": giro, "perfil_icc": descripcion_icc,
+                          "ruta_perfil_icc": icc_rel, "espacio_pdf": info.get("cs-name", ""),
+                          "dpi_efectivo_aprox": round(72 * ancho / rect.width, 1),
+                          "sha256_original": sha256(contenido["image"]),
+                          "ruta_original": original.relative_to(salida).as_posix(),
+                          "ruta_png": ruta_png, "calibracion_color": "no_verificada"})
+    if revision:
+        revision.save(salida / "revision" / f"pagina_{pagina.number+1:03d}.png")
+    return manifiesto
+
+
+def miniaturas(manifiesto, salida):
+    fotos = manifiesto[manifiesto.tipo.isin(["fruto_maduro", "pulpa"]) & manifiesto.ruta_png.ne("")]
+    # Hojas separadas de 18 fotos para revisar la asociacion registro/imagen.
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except OSError:
+        font = ImageFont.load_default()
+    registros = fotos.to_dict("records")
+    for inicio in range(0, len(registros), 18):
+        hoja = Image.new("RGB", (960, 6 * 245), "white")
+        dibujo = ImageDraw.Draw(hoja)
+        for j, fila in enumerate(registros[inicio:inicio+18]):
+            with Image.open(salida / fila["ruta_png"]) as foto:
+                foto.thumbnail((300, 200))
+                x, y = (j % 3) * 320, (j // 3) * 245
+                hoja.paste(foto, (x + (320-foto.width)//2, y))
+                dibujo.text((x+8, y+204), f"{fila['registro_grin']} {fila['tipo']}", fill="black", font=font)
+                dibujo.text((x+8, y+223), slug(fila['nombre_accesion'])[:38], fill="black", font=font)
+        hoja.save(salida / "revision" / f"contactos_{inicio//18+1:02d}.jpg", quality=90)
+
+
+def ejecutar(pdf, salida, inicio, fin, numeracion):
+    if not pdf.is_file():
+        raise FileNotFoundError(f"No existe el PDF: {pdf}. Ajuste PDF al inicio del script.")
+    if inicio > fin or inicio < 1 or numeracion not in {"impresa", "pdf"}:
+        raise ValueError("Revise el intervalo y NUMERACION.")
+    # Una ejecucion nunca mezcla archivos nuevos con resultados viejos.
+    if salida.exists() and any(salida.iterdir()):
+        raise FileExistsError(f"La salida no esta vacia: {salida}. Use otra carpeta para repetir.")
+    for carpeta in ["texto", "imagenes_originales", "perfiles_icc", "revision",
+                    "imagenes_png/fruto_maduro", "imagenes_png/pulpa", "imagenes_png/otros_organos"]:
+        (salida / carpeta).mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[
+        logging.StreamHandler(), logging.FileHandler(salida / "ejecucion.log", encoding="utf-8")], force=True)
+    avisos = []
+
+    def avisar(registro, tipo, detalle):
+        avisos.append({"registro_grin": registro, "tipo": tipo, "detalle": detalle})
+        logging.warning("REVISAR %s: %s - %s", registro, tipo, detalle)
+
+    accesiones, descriptores, imagenes, paginas_auditadas = [], [], [], []
+    with fitz.open(pdf) as doc:
+        # Las fichas se reconocen por su contenido y se unen por GRIN, no por nombre.
+        fichas = {}
+        for pagina in doc:
+            texto = pagina.get_text()
+            if not re.search(r"\b721\d{5}\b", texto):
+                continue  # guias e introduccion tambien mencionan descriptores
+            es_foto = "Nombre de la accesión" in texto
+            es_dato = "Forma de la copa" in texto and "Sólidos solubles totales" in texto
+            if not (es_foto or es_dato):
+                continue
+            registro = identificador(pagina)
+            numero = pagina_impresa(pagina)
+            clave = "foto" if es_foto else "datos"
+            ficha = fichas.setdefault(registro, {})
+            if clave in ficha:
+                raise ValueError(f"Ficha duplicada: {registro}, {clave}")
+            ficha[clave] = {"indice": pagina.number, "impresa": numero}
+        seleccion = []
+        for registro, ficha in fichas.items():
+            dentro = [v for v in ficha.values() if inicio <= (
+                v["impresa"] if numeracion == "impresa" else v["indice"]+1) <= fin]
+            if dentro:
+                seleccion.append((registro, ficha))
+        if not seleccion:
+            raise ValueError("No hay fichas en el intervalo solicitado.")
+        for registro, ficha in seleccion:
+            if set(ficha) != {"foto", "datos"}:
+                raise ValueError(f"No hay pareja completa para {registro}")
+            permitidas = {}
+            for clave, v in ficha.items():
+                n = v["impresa"] if numeracion == "impresa" else v["indice"]+1
+                if INCLUIR_PAREJA or inicio <= n <= fin:
+                    permitidas[clave] = v
+            if set(permitidas) != {"foto", "datos"}:
+                raise ValueError(f"El intervalo deja incompleta {registro}. Active INCLUIR_PAREJA.")
+            foto, datos = doc[ficha["foto"]["indice"]], doc[ficha["datos"]["indice"]]
+            for pagina in [foto, datos]:
+                if pagina.rect.width != 792 or pagina.rect.height != 612:
+                    raise ValueError("Diseno de pagina distinto al catalogo comprobado.")
+                imp = pagina_impresa(pagina)
+                n = imp if numeracion == "impresa" else pagina.number+1
+                (salida / "texto" / f"{registro}_pdf_{pagina.number+1:03d}.txt").write_text(pagina.get_text(), encoding="utf-8")
+                (salida / "texto" / f"{registro}_pdf_{pagina.number+1:03d}_coordenadas.json").write_text(
+                    json.dumps(lineas(pagina), ensure_ascii=False, indent=2), encoding="utf-8")
+                paginas_auditadas.append({"registro_grin": registro, "pagina_pdf": pagina.number+1,
+                                          "pagina_impresa": imp, "fuera_del_intervalo_apoyo": not inicio <= n <= fin})
+            meta = {"registro_grin": registro, **pasaporte(foto),
+                    "pagina_fotos_pdf": foto.number+1, "pagina_datos_pdf": datos.number+1,
+                    "pagina_fotos_impresa": pagina_impresa(foto), "pagina_datos_impresa": pagina_impresa(datos)}
+            filas, obs = extraer_descriptores(datos, registro, avisar)
+            meta["observaciones_originales"] = obs
+            accesiones.append(meta)
+            descriptores.extend(filas)
+            fotos = extraer_imagenes(doc, foto, registro, meta["nombre_accesion"], salida, avisar)
+            imagenes.extend(fotos)
+            for tipo in ETIQUETAS.values():
+                cantidad = sum(i["tipo"] == tipo for i in fotos)
+                if cantidad != 1:
+                    avisar(registro, "cantidad_por_organo", f"{tipo}: {cantidad} (esperado 1)")
+            logging.info("%s | %s | %s descriptores | %s imagenes", registro, meta["nombre_accesion"], len(filas), len(fotos))
+
+    a, d, m = pd.DataFrame(accesiones), pd.DataFrame(descriptores), pd.DataFrame(imagenes)
+    if d.duplicated(["registro_grin", "campo"]).any():
+        raise ValueError("Descriptores duplicados: no se generara una tabla ancha ambigua.")
+    if a.registro_grin.duplicated().any() or not set(m.registro_grin).issubset(set(a.registro_grin)):
+        raise ValueError("Error de integridad registro/imagen.")
+    for registro, bloque in d.groupby("registro_grin"):
+        if len(bloque) != 93:
+            avisar(registro, "total_descriptores", f"{len(bloque)} / 93")
+    # Texto literal en tabla ancha: 'NA' permanece como texto. El indicador es_faltante
+    # y la columna numerica permiten tratar nulos sin perder el registro original.
+    ancha = a.merge(d.pivot(index="registro_grin", columns="campo", values="valor_original").reset_index(),
+                    on="registro_grin", validate="one_to_one")
+    numerica = d.pivot(index="registro_grin", columns="campo", values="valor_numerico").dropna(axis=1, how="all").reset_index()
+    diccionario = d[["campo", "seccion", "descriptor_original", "unidad_declarada"]].drop_duplicates()
+    tablas = {"accesiones": a, "descriptores_largo": d, "base_ancha": ancha,
+              "valores_numericos": numerica, "imagenes": m, "diccionario": diccionario,
+              "paginas": pd.DataFrame(paginas_auditadas),
+              "advertencias": pd.DataFrame(avisos, columns=["registro_grin", "tipo", "detalle"])}
+    for nombre, tabla in tablas.items():
+        tabla.to_csv(salida / f"{nombre}.csv", index=False, sep=";", encoding="utf-8-sig", decimal=",")
+    with sqlite3.connect(salida / "mangos.sqlite") as conexion:
+        for nombre, tabla in tablas.items():
+            tabla.to_sql(nombre, conexion, index=False, if_exists="replace")
+        conexion.execute("CREATE UNIQUE INDEX idx_accesion ON accesiones(registro_grin)")
+        conexion.execute("CREATE UNIQUE INDEX idx_descriptor ON descriptores_largo(registro_grin, campo)")
+        conexion.execute("CREATE INDEX idx_imagen ON imagenes(registro_grin, tipo)")
+        assert conexion.execute("SELECT COUNT(*) FROM accesiones").fetchone()[0] == len(a)
+    if GENERAR_REVISION:
+        miniaturas(m, salida)
+    resumen = {"pdf": pdf.name, "sha256_pdf": sha256(pdf.read_bytes()),
+               "fecha_utc": datetime.now(timezone.utc).isoformat(), "numeracion": numeracion,
+               "intervalo_solicitado": [inicio, fin], "incluir_pareja": INCLUIR_PAREJA,
+               "accesiones": len(a), "descriptores": len(d), "imagenes": len(m),
+               "imagenes_por_tipo": m.tipo.value_counts().to_dict(),
+               "advertencias": len(avisos), "python": platform.python_version(),
+               "pymupdf": fitz.VersionBind, "pandas": pd.__version__,
+               "nota_color": "PNG sin interpolacion, mejora ni correccion de color. ICC PDF recuperado; calibracion fotografica no verificada."}
+    (salida / "resumen.json").write_text(json.dumps(resumen, ensure_ascii=False, indent=2), encoding="utf-8")
+    logging.info("Terminado: %s accesiones, %s datos, %s imagenes. Salida: %s", len(a), len(d), len(m), salida)
+    logging.info("Revise advertencias.csv y revision/. Los NA del libro se conservan.")
+    return resumen
+
+
+# %% EJECUCION: Positron (Run File) o terminal con argumentos opcionales
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pdf", type=Path, default=PDF)
+    parser.add_argument("--salida", type=Path, default=SALIDA)
+    parser.add_argument("--inicio", type=int, default=PAGINA_INICIAL)
+    parser.add_argument("--fin", type=int, default=PAGINA_FINAL)
+    parser.add_argument("--numeracion", choices=["impresa", "pdf"], default=NUMERACION)
+    args = parser.parse_args()
+    ejecutar(args.pdf, args.salida, args.inicio, args.fin, args.numeracion)
